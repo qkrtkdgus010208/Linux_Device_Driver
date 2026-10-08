@@ -108,6 +108,67 @@ static void update_hardware(void)
     }
 }
 
+static void render_dashboard(void);
+
+static int64_t get_time_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int64_t g_last_toggle_ms = 0;
+
+/* Safely reverse motor direction: stop briefly to prevent back-EMF spike & drain induced noise */
+static void change_direction_safe(void)
+{
+    /* 1. Toggle target direction */
+    g_direction = (g_direction == MOTOR_DIR_FORWARD) ? MOTOR_DIR_BACKWARD : MOTOR_DIR_FORWARD;
+
+    /* 2. Soft reversal: if motor is spinning, briefly pause to avoid inductive voltage surge */
+    if (g_fd_motor >= 0 && g_speed_step > 0) {
+        int zero = 0;
+        int stop_dir = MOTOR_DIR_STOP;
+        ioctl(g_fd_motor, MOTOR_IOCTL_SET_SPEED, &zero);
+        ioctl(g_fd_motor, MOTOR_IOCTL_SET_DIR, &stop_dir);
+    }
+
+    /* 3. Flash LED bar briefly for visual feedback */
+    if (g_fd_ledbar >= 0) {
+        uint8_t flash_mask = 0xFF;
+        ioctl(g_fd_ledbar, LEDBAR_IOCTL_SET_RAW, &flash_mask);
+    }
+    usleep(50000); /* 50ms pause: lets motor current drop to 0 and back-EMF dissipate */
+
+    /* 4. Restore motor speed and new direction */
+    update_hardware();
+    render_dashboard();
+
+    /* 5. Drain any false pulses induced on the EC11 lines by the motor reversal */
+    if (g_fd_ec11 >= 0) {
+        usleep(30000); /* 30ms buffer for contact/motor inrush ringing to settle */
+        int fl = fcntl(g_fd_ec11, F_GETFL, 0);
+        fcntl(g_fd_ec11, F_SETFL, fl | O_NONBLOCK);
+        struct ec11_event dummy;
+        while (read(g_fd_ec11, &dummy, sizeof(dummy)) > 0) {}
+        fcntl(g_fd_ec11, F_SETFL, fl);
+    }
+
+    /* 6. Discard extra queued keys from terminal input buffer (e.g. held Spacebar) */
+    tcflush(STDIN_FILENO, TCIFLUSH);
+}
+
+/* Debounced direction toggle with 350ms cooldown */
+static void try_change_direction(void)
+{
+    int64_t now_ms = get_time_ms();
+    if (now_ms - g_last_toggle_ms < 350)
+        return;
+
+    change_direction_safe();
+    g_last_toggle_ms = get_time_ms();
+}
+
 /* Render Dashboard in Console */
 static void render_dashboard(void)
 {
@@ -249,8 +310,6 @@ int main(int argc, char *argv[])
     fds[1].fd = STDIN_FILENO;
     fds[1].events = POLLIN;
 
-    int64_t last_toggle_ms = 0;
-
     while (g_running) {
         int poll_ret = poll(fds, 2, 1000); /* 1000ms timeout for periodic refresh */
 
@@ -276,12 +335,7 @@ int main(int argc, char *argv[])
                     update_hardware();
                     render_dashboard();
                 } else if (ch == ' ' || ch == 'd' || ch == 'D') {
-                    g_direction = (g_direction == MOTOR_DIR_FORWARD) ? MOTOR_DIR_BACKWARD : MOTOR_DIR_FORWARD;
-                    uint8_t flash_mask = 0xFF;
-                    ioctl(g_fd_ledbar, LEDBAR_IOCTL_SET_RAW, &flash_mask);
-                    usleep(30000);
-                    update_hardware();
-                    render_dashboard();
+                    try_change_direction();
                 } else if (ch == 'q' || ch == 'Q' || ch == 27) {
                     g_running = 0;
                     break;
@@ -312,30 +366,9 @@ int main(int argc, char *argv[])
                     render_dashboard();
                 }
 
-                /* Handle Push Switch Event (with 200ms anti-flutter cooldown) */
+                /* Handle Push Switch Event */
                 if (ev.sw_state == 2) {
-                    struct timespec ts;
-                    clock_gettime(CLOCK_MONOTONIC, &ts);
-                    int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-
-                    if (now_ms - last_toggle_ms >= 200) {
-                        last_toggle_ms = now_ms;
-
-                        /* Toggle Direction between FORWARD and BACKWARD */
-                        if (g_direction == MOTOR_DIR_FORWARD) {
-                            g_direction = MOTOR_DIR_BACKWARD;
-                        } else {
-                            g_direction = MOTOR_DIR_FORWARD;
-                        }
-
-                        /* Flash LED bar briefly for direction change indication */
-                        uint8_t flash_mask = 0xFF;
-                        ioctl(g_fd_ledbar, LEDBAR_IOCTL_SET_RAW, &flash_mask);
-                        usleep(30000); /* 30ms flash */
-
-                        update_hardware();
-                        render_dashboard();
-                    }
+                    try_change_direction();
                 }
             }
         }
