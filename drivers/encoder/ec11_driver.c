@@ -76,9 +76,9 @@ static int steps_per_detent = 4;
 module_param(steps_per_detent, int, 0644);
 MODULE_PARM_DESC(steps_per_detent, "Quadrature transitions per detent: 4 = full cycle per click (default), 2 = half cycle per click");
 
-static int rebound_ms = 15;
+static int rebound_ms = 0;
 module_param(rebound_ms, int, 0644);
-MODULE_PARM_DESC(rebound_ms, "Detent snap-in backlash/rebound suppression window in ms (default 15)");
+MODULE_PARM_DESC(rebound_ms, "Deprecated, ignored (recoil rejected naturally by Buxtronix FSM)");
 
 static int key_debounce_ms = 150;
 module_param(key_debounce_ms, int, 0644);
@@ -104,30 +104,26 @@ static int irq_key = -1;
 
 static int accumulated_pos = 0;
 static ktime_t last_key_time;
-static ktime_t last_step_time;
-static int last_step_dir = 0;
 
 /*
- * Quadrature decoder state, shared by the S1 and S2 IRQ handlers
- * (which may run concurrently on different CPUs) and the ioctl path.
- */
-static DEFINE_SPINLOCK(enc_lock);
-static u8 enc_state = 3;   /* (S1 << 1) | S2, both HIGH at rest */
-static int enc_acc = 0;    /* quarter steps accumulated since last rest state */
-
-/*
- * Indexed by (prev_state << 2) | new_state.
- * CW sequence (S1,S2): 11 -> 01 -> 00 -> 10 -> 11  =>  +1 per transition.
- * CCW is the reverse   =>  -1. Same state or a 2-bit jump (missed edge) => 0.
- * Bounce on one line toggles between two adjacent states (+1,-1,+1,-1...),
- * so it cancels out instead of producing a step.
+ * Standard Quadrature Lookup Table (16 states)
+ * Row: old_state (0~3), Column: new_state (0~3)
+ * State encoding: bit 1 = S1 (CLK), bit 0 = S2 (DT)
+ * CW sequence:  11(3) -> 01(1) -> 00(0) -> 10(2) -> 11(3)  => +1 each
+ * CCW sequence: 11(3) -> 10(2) -> 00(0) -> 01(1) -> 11(3)  => -1 each
  */
 static const s8 quad_table[16] = {
-     0, -1, +1,  0,
-    +1,  0,  0, -1,
-    -1,  0,  0, +1,
-     0, +1, -1,  0,
+     0, -1, +1,  0,   /* old=00: to 00(0), 01(-1), 10(+1), 11(0) */
+    +1,  0,  0, -1,   /* old=01: to 00(+1), 01(0), 10(0), 11(-1) */
+    -1,  0,  0, +1,   /* old=10: to 00(-1), 01(0), 10(0), 11(+1) */
+     0, +1, -1,  0,   /* old=11: to 00(0), 01(+1), 10(-1), 11(0) */
 };
+
+static DEFINE_SPINLOCK(enc_lock);
+static u8 enc_state = 3;
+static int enc_acc = 0;
+static bool step_fired = false;
+static bool in_detent = true;
 
 /* Circular Event Queue */
 static struct ec11_event queue[QUEUE_SIZE];
@@ -200,19 +196,20 @@ static int resolve_gpio(int offset)
 
 /*
  * Shared handler for S1 and S2, both edges.
- * Re-reads both lines, advances the quadrature state machine, and emits one
- * event only when the encoder settles back in a detent (rest) position after
- * a complete, consistent sequence of transitions.
+ * Accurately decodes rotation using detent exit-unlatch logic:
+ * - When exiting detent: latch is unlocked for the new click.
+ * - During movement: fires immediately at threshold 2 (immediate response on direction reversal).
+ * - Once fired: strictly locked against double steps until entering AND exiting the next detent.
+ * - When entering detent: accumulator is cleared, latch remains locked against settling chatter.
  */
 static irqreturn_t ec11_rot_irq_handler(int irq, void *dev_id)
 {
     unsigned long flags;
     u8 new_state;
-    bool rest;
-    int step = 0;
     int delta;
+    int step = 0;
+    bool is_detent_state;
     struct ec11_event ev;
-    ktime_t now = ktime_get();
 
     spin_lock_irqsave(&enc_lock, flags);
 
@@ -227,49 +224,49 @@ static irqreturn_t ec11_rot_irq_handler(int irq, void *dev_id)
     delta = quad_table[(enc_state << 2) | new_state];
     enc_state = new_state;
 
-    if (delta != 0) {
-        enc_acc += delta;
-    }
-
     if (steps_per_detent == 2)
-        rest = (new_state == 0 || new_state == 3);
+        is_detent_state = (new_state == 3 || new_state == 0);
     else
-        rest = (new_state == 3);
-
-    if (rest) {
-        /*
-         * A full mechanical detent step consists of 4 quadrature transitions.
-         * Due to contact backlash/settling when reversing rotation direction,
-         * 2 transitions in the target direction guarantee intentional movement
-         * while filtering out 1-step contact recoil and jitter.
-         */
-        int need = (steps_per_detent == 2) ? 1 : 2;
-
-        if (enc_acc >= need)
-            step = 1;
-        else if (enc_acc <= -need)
-            step = -1;
-        enc_acc = 0;
-    }
+        is_detent_state = (new_state == 3);
 
     /*
-     * Rebound / Backlash Filter:
-     * If this step is in the opposite direction of the last step and occurred
-     * within rebound_ms (70ms), it is mechanical detent snap-in recoil. Drop it!
+     * Detent Transition Tracking:
+     * When leaving detent (starting a new click), unlock the latch for this new click.
      */
-    if (step != 0) {
-        if (last_step_dir != 0 && step == -last_step_dir) {
-            s64 interval_ms = ktime_to_ms(ktime_sub(now, last_step_time));
-            if (interval_ms < rebound_ms) {
-                step = 0;
+    if (!is_detent_state) {
+        if (in_detent) {
+            in_detent = false;
+            step_fired = false;
+            enc_acc = 0;
+        }
+    } else {
+        in_detent = true;
+    }
+
+    if (delta != 0) {
+        enc_acc += delta;
+
+        /*
+         * Threshold 2: immediate response on the very 1st click during direction reversal.
+         * step_fired latch strictly prevents double steps until the next physical click.
+         */
+        if (!step_fired) {
+            if (enc_acc >= 2) {
+                step = 1;
+                step_fired = true;
+            } else if (enc_acc <= -2) {
+                step = -1;
+                step_fired = true;
             }
         }
     }
 
-    if (step != 0) {
-        last_step_dir = step;
-        last_step_time = now;
+    /* Clear accumulator when settled in detent to eliminate any residual bounce */
+    if (is_detent_state) {
+        enc_acc = 0;
+    }
 
+    if (step != 0) {
         if (invert_dir)
             step = -step;
         accumulated_pos += step;
@@ -280,7 +277,7 @@ static irqreturn_t ec11_rot_irq_handler(int irq, void *dev_id)
 
     spin_unlock_irqrestore(&enc_lock, flags);
 
-    if (step)
+    if (step != 0)
         enqueue_event(&ev);
 
     return IRQ_HANDLED;
@@ -429,8 +426,6 @@ static int __init ec11_init(void)
     spin_lock_init(&queue_lock);
     init_waitqueue_head(&ec11_waitq);
     last_key_time = ktime_set(0, 0);
-    last_step_time = ktime_set(0, 0);
-    last_step_dir = 0;
 
     /* Allocate Character Device Number */
     ret = alloc_chrdev_region(&dev_number, 0, 1, DEVICE_NAME);
@@ -503,10 +498,12 @@ static int __init ec11_init(void)
         goto free_key;
     }
 
-    /* Initial decoder state from the current line levels */
+    /* Initial encoder state */
     enc_state = (gpio_get_value(real_gpio_s1) ? 2 : 0) |
                 (gpio_get_value(real_gpio_s2) ? 1 : 0);
     enc_acc = 0;
+    step_fired = false;
+    in_detent = true;
 
     if (steps_per_detent != 2 && steps_per_detent != 4) {
         pr_warn("ec11: steps_per_detent=%d invalid, using 4\n", steps_per_detent);
