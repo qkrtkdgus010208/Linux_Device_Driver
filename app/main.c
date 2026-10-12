@@ -20,30 +20,6 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <time.h>
-#include <termios.h>
-
-static struct termios orig_termios;
-static int raw_mode_active = 0;
-
-static void disable_raw_mode(void) {
-    if (raw_mode_active) {
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-        raw_mode_active = 0;
-    }
-}
-
-static void enable_raw_mode(void) {
-    if (isatty(STDIN_FILENO)) {
-        if (tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
-            struct termios raw = orig_termios;
-            raw.c_lflag &= ~(ECHO | ICANON);
-            raw.c_cc[VMIN] = 0;
-            raw.c_cc[VTIME] = 0;
-            tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-            raw_mode_active = 1;
-        }
-    }
-}
 
 #include "../include/common_ioctl.h"
 
@@ -108,67 +84,6 @@ static void update_hardware(void)
     }
 }
 
-static void render_dashboard(void);
-
-static int64_t get_time_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-static int64_t g_last_toggle_ms = 0;
-
-/* Safely reverse motor direction: stop briefly to prevent back-EMF spike & drain induced noise */
-static void change_direction_safe(void)
-{
-    /* 1. Toggle target direction */
-    g_direction = (g_direction == MOTOR_DIR_FORWARD) ? MOTOR_DIR_BACKWARD : MOTOR_DIR_FORWARD;
-
-    /* 2. Soft reversal: if motor is spinning, briefly pause to avoid inductive voltage surge */
-    if (g_fd_motor >= 0 && g_speed_step > 0) {
-        int zero = 0;
-        int stop_dir = MOTOR_DIR_STOP;
-        ioctl(g_fd_motor, MOTOR_IOCTL_SET_SPEED, &zero);
-        ioctl(g_fd_motor, MOTOR_IOCTL_SET_DIR, &stop_dir);
-    }
-
-    /* 3. Flash LED bar briefly for visual feedback */
-    if (g_fd_ledbar >= 0) {
-        uint8_t flash_mask = 0xFF;
-        ioctl(g_fd_ledbar, LEDBAR_IOCTL_SET_RAW, &flash_mask);
-    }
-    usleep(50000); /* 50ms pause: lets motor current drop to 0 and back-EMF dissipate */
-
-    /* 4. Restore motor speed and new direction */
-    update_hardware();
-    render_dashboard();
-
-    /* 5. Drain any false pulses induced on the EC11 lines by the motor reversal */
-    if (g_fd_ec11 >= 0) {
-        usleep(30000); /* 30ms buffer for contact/motor inrush ringing to settle */
-        int fl = fcntl(g_fd_ec11, F_GETFL, 0);
-        fcntl(g_fd_ec11, F_SETFL, fl | O_NONBLOCK);
-        struct ec11_event dummy;
-        while (read(g_fd_ec11, &dummy, sizeof(dummy)) > 0) {}
-        fcntl(g_fd_ec11, F_SETFL, fl);
-    }
-
-    /* 6. Discard extra queued keys from terminal input buffer (e.g. held Spacebar) */
-    tcflush(STDIN_FILENO, TCIFLUSH);
-}
-
-/* Debounced direction toggle with 350ms cooldown */
-static void try_change_direction(void)
-{
-    int64_t now_ms = get_time_ms();
-    if (now_ms - g_last_toggle_ms < 350)
-        return;
-
-    change_direction_safe();
-    g_last_toggle_ms = get_time_ms();
-}
-
 /* Render Dashboard in Console */
 static void render_dashboard(void)
 {
@@ -207,9 +122,9 @@ static void render_dashboard(void)
     printf(" Encoder Pos  : %+d steps\n", g_position);
     printf("------------------------------------------------------------------\n");
     printf(" [Operation Instructions]\n");
-    printf("  * Rotate Knob (S1/S2) or Press [W] / [S] : Speed Step (0 -> 8)\n");
-    printf("  * Click Knob  (KEY)   or Press [SPACE]   : Toggle Direction (FWD <-> REV)\n");
-    printf("  * Press [Q] or Ctrl + C                  : Safe Stop and Exit\n");
+    printf("  * Rotate Knob (S1/S2) : Speed Step (0 -> 8)\n");
+    printf("  * Click Knob  (KEY)   : Toggle Direction (FWD <-> REV)\n");
+    printf("  * Press Ctrl + C      : Safe Stop and Exit\n");
     printf("==================================================================\n");
     fflush(stdout);
 }
@@ -217,7 +132,6 @@ static void render_dashboard(void)
 /* Safe Hardware Cleanup */
 static void cleanup_hardware(void)
 {
-    disable_raw_mode();
     printf("\nShutting down devices safely...\n");
 
     if (g_fd_motor >= 0) {
@@ -248,7 +162,6 @@ static void cleanup_hardware(void)
 int main(int argc, char *argv[])
 {
     struct sigaction sa;
-    struct pollfd fds[2];
 
     (void)argc;
     (void)argv;
@@ -259,8 +172,8 @@ int main(int argc, char *argv[])
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    /* Open EC11 Device Node */
-    g_fd_ec11 = open(DEV_EC11, O_RDONLY);
+    /* Open EC11 Device Node (Non-blocking mode) */
+    g_fd_ec11 = open(DEV_EC11, O_RDONLY | O_NONBLOCK);
     if (g_fd_ec11 < 0) {
         fprintf(stderr, "Error: Cannot open %s: %s\n", DEV_EC11, strerror(errno));
         fprintf(stderr, "Hint: Did you insert the module? Try: sudo insmod drivers/encoder/ec11_driver.ko\n");
@@ -288,11 +201,8 @@ int main(int argc, char *argv[])
 
     /* Drain any stale events in queue from before daemon started */
     {
-        int fl = fcntl(g_fd_ec11, F_GETFL, 0);
-        fcntl(g_fd_ec11, F_SETFL, fl | O_NONBLOCK);
         struct ec11_event drain_ev;
         while (read(g_fd_ec11, &drain_ev, sizeof(drain_ev)) > 0) {}
-        fcntl(g_fd_ec11, F_SETFL, fl);
         ioctl(g_fd_ec11, EC11_IOCTL_RESET_POS);
         g_position = 0;
     }
@@ -301,17 +211,15 @@ int main(int argc, char *argv[])
     update_hardware();
     render_dashboard();
 
-    /* Enable non-canonical raw terminal mode for instant keyboard control */
-    enable_raw_mode();
+    /* Prepare poll structure for EC11 only (no keyboard polling) */
+    struct pollfd pfd;
+    pfd.fd = g_fd_ec11;
+    pfd.events = POLLIN;
 
-    /* Prepare poll structures: fds[0] for EC11, fds[1] for Keyboard */
-    fds[0].fd = g_fd_ec11;
-    fds[0].events = POLLIN;
-    fds[1].fd = STDIN_FILENO;
-    fds[1].events = POLLIN;
+    int64_t last_toggle_ms = 0;
 
     while (g_running) {
-        int poll_ret = poll(fds, 2, 1000); /* 1000ms timeout for periodic refresh */
+        int poll_ret = poll(&pfd, 1, 1000); /* 1000ms timeout for periodic refresh */
 
         if (poll_ret < 0) {
             if (errno == EINTR)
@@ -320,35 +228,12 @@ int main(int argc, char *argv[])
             break;
         }
 
-        /* 1. Handle Keyboard Inputs */
-        if (poll_ret > 0 && (fds[1].revents & POLLIN)) {
-            char ch = 0;
-            if (read(STDIN_FILENO, &ch, 1) == 1) {
-                if (ch == 'w' || ch == 'W' || ch == '+' || ch == 'k' || ch == 'K') {
-                    if (g_speed_step < 8)
-                        g_speed_step++;
-                    update_hardware();
-                    render_dashboard();
-                } else if (ch == 's' || ch == 'S' || ch == '-' || ch == 'j' || ch == 'J') {
-                    if (g_speed_step > 0)
-                        g_speed_step--;
-                    update_hardware();
-                    render_dashboard();
-                } else if (ch == ' ' || ch == 'd' || ch == 'D') {
-                    try_change_direction();
-                } else if (ch == 'q' || ch == 'Q' || ch == 27) {
-                    g_running = 0;
-                    break;
-                }
-            }
-        }
-
-        /* 2. Handle EC11 Hardware Encoder Events */
-        if (poll_ret > 0 && (fds[0].revents & POLLIN)) {
+        /* Handle EC11 Hardware Encoder Events */
+        if (poll_ret > 0 && (pfd.revents & POLLIN)) {
             struct ec11_event ev;
-            ssize_t bytes_read = read(g_fd_ec11, &ev, sizeof(ev));
+            int changed = 0;
 
-            if (bytes_read == sizeof(ev)) {
+            while (read(g_fd_ec11, &ev, sizeof(ev)) == sizeof(ev)) {
                 g_position = ev.position;
 
                 /* Handle Rotation Event */
@@ -362,14 +247,40 @@ int main(int argc, char *argv[])
                         if (g_speed_step > 0)
                             g_speed_step--;
                     }
-                    update_hardware();
-                    render_dashboard();
+                    changed = 1;
                 }
 
-                /* Handle Push Switch Event */
+                /* Handle Push Switch Event (with 350ms anti-flutter cooldown) */
                 if (ev.sw_state == 2) {
-                    try_change_direction();
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+
+                    if (now_ms - last_toggle_ms >= 350) {
+                        last_toggle_ms = now_ms;
+
+                        /* Toggle Direction between FORWARD and BACKWARD */
+                        if (g_direction == MOTOR_DIR_FORWARD) {
+                            g_direction = MOTOR_DIR_BACKWARD;
+                        } else {
+                            g_direction = MOTOR_DIR_FORWARD;
+                        }
+
+                        /* Flash LED bar briefly for direction change indication */
+                        if (g_fd_ledbar >= 0) {
+                            uint8_t flash_mask = 0xFF;
+                            ioctl(g_fd_ledbar, LEDBAR_IOCTL_SET_RAW, &flash_mask);
+                            usleep(30000); /* 30ms flash */
+                        }
+
+                        changed = 1;
+                    }
                 }
+            }
+
+            if (changed) {
+                update_hardware();
+                render_dashboard();
             }
         }
     }

@@ -63,13 +63,13 @@ static int pin_sw = -1;
 module_param(pin_sw, int, 0644);
 MODULE_PARM_DESC(pin_sw, "Alias for pin_key");
 
-static int debounce_ms = 5;
+static int debounce_ms = 12;
 module_param(debounce_ms, int, 0644);
-MODULE_PARM_DESC(debounce_ms, "Encoder rotation debounce time in ms (default 5)");
+MODULE_PARM_DESC(debounce_ms, "Encoder rotation debounce time in ms (default 12)");
 
-static int key_debounce_ms = 80;
+static int key_debounce_ms = 150;
 module_param(key_debounce_ms, int, 0644);
-MODULE_PARM_DESC(key_debounce_ms, "Key switch debounce time in ms (default 80)");
+MODULE_PARM_DESC(key_debounce_ms, "Key switch debounce time in ms (default 150)");
 
 static int invert_dir = 0;
 module_param(invert_dir, int, 0644);
@@ -166,13 +166,20 @@ static irqreturn_t ec11_s1_irq_handler(int irq, void *dev_id)
 {
     ktime_t now = ktime_get();
     s64 delta_ms = ktime_to_ms(ktime_sub(now, last_s1_time));
-    int s2_val;
+    int s1_val, s2_val;
     int step;
     struct ec11_event ev;
 
     if (delta_ms < debounce_ms) {
         return IRQ_HANDLED;
     }
+
+    /* Glitch Validation: S1 must actually be LOW (falling edge confirmed) */
+    s1_val = gpio_get_value(real_gpio_s1);
+    if (s1_val != 0) {
+        return IRQ_HANDLED;
+    }
+
     last_s1_time = now;
 
     /* Sample S2 (DT) level at S1 (CLK) falling edge */
@@ -204,11 +211,19 @@ static irqreturn_t ec11_key_irq_handler(int irq, void *dev_id)
 {
     ktime_t now = ktime_get();
     s64 delta_ms = ktime_to_ms(ktime_sub(now, last_key_time));
+    int key_val;
     struct ec11_event ev;
 
     if (delta_ms < key_debounce_ms) {
         return IRQ_HANDLED;
     }
+
+    /* Glitch & Vibration Validation: KEY switch must actually be pressed (LOW) */
+    key_val = gpio_get_value(real_gpio_key);
+    if (key_val != 0) {
+        return IRQ_HANDLED;
+    }
+
     last_key_time = now;
 
     ev.delta = 0;
