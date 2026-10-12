@@ -63,9 +63,22 @@ static int pin_sw = -1;
 module_param(pin_sw, int, 0644);
 MODULE_PARM_DESC(pin_sw, "Alias for pin_key");
 
-static int debounce_ms = 12;
+/*
+ * Kept only so existing "insmod ... debounce_ms=N" command lines still load.
+ * Rotation no longer uses a time filter: the quadrature state machine below
+ * rejects contact bounce by itself, and a time filter would drop real edges.
+ */
+static int debounce_ms = 0;
 module_param(debounce_ms, int, 0644);
-MODULE_PARM_DESC(debounce_ms, "Encoder rotation debounce time in ms (default 12)");
+MODULE_PARM_DESC(debounce_ms, "Deprecated, ignored (rotation is decoded by a quadrature state machine)");
+
+static int steps_per_detent = 4;
+module_param(steps_per_detent, int, 0644);
+MODULE_PARM_DESC(steps_per_detent, "Quadrature transitions per detent: 4 = full cycle per click (default), 2 = half cycle per click");
+
+static int rebound_ms = 15;
+module_param(rebound_ms, int, 0644);
+MODULE_PARM_DESC(rebound_ms, "Detent snap-in backlash/rebound suppression window in ms (default 15)");
 
 static int key_debounce_ms = 150;
 module_param(key_debounce_ms, int, 0644);
@@ -86,11 +99,35 @@ static int real_gpio_s2 = -1;
 static int real_gpio_key = -1;
 
 static int irq_s1 = -1;
+static int irq_s2 = -1;
 static int irq_key = -1;
 
 static int accumulated_pos = 0;
-static ktime_t last_s1_time;
 static ktime_t last_key_time;
+static ktime_t last_step_time;
+static int last_step_dir = 0;
+
+/*
+ * Quadrature decoder state, shared by the S1 and S2 IRQ handlers
+ * (which may run concurrently on different CPUs) and the ioctl path.
+ */
+static DEFINE_SPINLOCK(enc_lock);
+static u8 enc_state = 3;   /* (S1 << 1) | S2, both HIGH at rest */
+static int enc_acc = 0;    /* quarter steps accumulated since last rest state */
+
+/*
+ * Indexed by (prev_state << 2) | new_state.
+ * CW sequence (S1,S2): 11 -> 01 -> 00 -> 10 -> 11  =>  +1 per transition.
+ * CCW is the reverse   =>  -1. Same state or a 2-bit jump (missed edge) => 0.
+ * Bounce on one line toggles between two adjacent states (+1,-1,+1,-1...),
+ * so it cancels out instead of producing a step.
+ */
+static const s8 quad_table[16] = {
+     0, -1, +1,  0,
+    +1,  0,  0, -1,
+    -1,  0,  0, +1,
+     0, +1, -1,  0,
+};
 
 /* Circular Event Queue */
 static struct ec11_event queue[QUEUE_SIZE];
@@ -161,47 +198,90 @@ static int resolve_gpio(int offset)
     return gpio_base + offset;
 }
 
-/* Interrupt Handler for S1 (CLK) Falling Edge */
-static irqreturn_t ec11_s1_irq_handler(int irq, void *dev_id)
+/*
+ * Shared handler for S1 and S2, both edges.
+ * Re-reads both lines, advances the quadrature state machine, and emits one
+ * event only when the encoder settles back in a detent (rest) position after
+ * a complete, consistent sequence of transitions.
+ */
+static irqreturn_t ec11_rot_irq_handler(int irq, void *dev_id)
 {
-    ktime_t now = ktime_get();
-    s64 delta_ms = ktime_to_ms(ktime_sub(now, last_s1_time));
-    int s1_val, s2_val;
-    int step;
+    unsigned long flags;
+    u8 new_state;
+    bool rest;
+    int step = 0;
+    int delta;
     struct ec11_event ev;
+    ktime_t now = ktime_get();
 
-    if (delta_ms < debounce_ms) {
+    spin_lock_irqsave(&enc_lock, flags);
+
+    new_state = (gpio_get_value(real_gpio_s1) ? 2 : 0) |
+                (gpio_get_value(real_gpio_s2) ? 1 : 0);
+
+    if (new_state == enc_state) {
+        spin_unlock_irqrestore(&enc_lock, flags);
         return IRQ_HANDLED;
     }
 
-    /* Glitch Validation: S1 must actually be LOW (falling edge confirmed) */
-    s1_val = gpio_get_value(real_gpio_s1);
-    if (s1_val != 0) {
-        return IRQ_HANDLED;
+    delta = quad_table[(enc_state << 2) | new_state];
+    enc_state = new_state;
+
+    if (delta != 0) {
+        enc_acc += delta;
     }
 
-    last_s1_time = now;
+    if (steps_per_detent == 2)
+        rest = (new_state == 0 || new_state == 3);
+    else
+        rest = (new_state == 3);
 
-    /* Sample S2 (DT) level at S1 (CLK) falling edge */
-    s2_val = gpio_get_value(real_gpio_s2);
+    if (rest) {
+        /*
+         * A full mechanical detent step consists of 4 quadrature transitions.
+         * Due to contact backlash/settling when reversing rotation direction,
+         * 2 transitions in the target direction guarantee intentional movement
+         * while filtering out 1-step contact recoil and jitter.
+         */
+        int need = (steps_per_detent == 2) ? 1 : 2;
+
+        if (enc_acc >= need)
+            step = 1;
+        else if (enc_acc <= -need)
+            step = -1;
+        enc_acc = 0;
+    }
 
     /*
-     * If S2 is HIGH when S1 falls, rotation is clockwise (CW).
-     * If S2 is LOW, rotation is counter-clockwise (CCW).
+     * Rebound / Backlash Filter:
+     * If this step is in the opposite direction of the last step and occurred
+     * within rebound_ms (70ms), it is mechanical detent snap-in recoil. Drop it!
      */
-    if (s2_val > 0) {
-        step = invert_dir ? -1 : 1;
-    } else {
-        step = invert_dir ? 1 : -1;
+    if (step != 0) {
+        if (last_step_dir != 0 && step == -last_step_dir) {
+            s64 interval_ms = ktime_to_ms(ktime_sub(now, last_step_time));
+            if (interval_ms < rebound_ms) {
+                step = 0;
+            }
+        }
     }
 
-    accumulated_pos += step;
+    if (step != 0) {
+        last_step_dir = step;
+        last_step_time = now;
 
-    ev.delta = step;
-    ev.sw_state = 0;
-    ev.position = accumulated_pos;
+        if (invert_dir)
+            step = -step;
+        accumulated_pos += step;
+        ev.delta = step;
+        ev.sw_state = 0;
+        ev.position = accumulated_pos;
+    }
 
-    enqueue_event(&ev);
+    spin_unlock_irqrestore(&enc_lock, flags);
+
+    if (step)
+        enqueue_event(&ev);
 
     return IRQ_HANDLED;
 }
@@ -292,17 +372,22 @@ static __poll_t ec11_poll(struct file *file, struct poll_table_struct *wait)
 static long ec11_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     int val;
+    unsigned long flags;
 
     switch (cmd) {
     case EC11_IOCTL_GET_POS:
+        spin_lock_irqsave(&enc_lock, flags);
         val = accumulated_pos;
+        spin_unlock_irqrestore(&enc_lock, flags);
         if (copy_to_user((int __user *)arg, &val, sizeof(int))) {
             return -EFAULT;
         }
         break;
 
     case EC11_IOCTL_RESET_POS:
+        spin_lock_irqsave(&enc_lock, flags);
         accumulated_pos = 0;
+        spin_unlock_irqrestore(&enc_lock, flags);
         break;
 
     case EC11_IOCTL_GET_SW:
@@ -343,8 +428,9 @@ static int __init ec11_init(void)
 
     spin_lock_init(&queue_lock);
     init_waitqueue_head(&ec11_waitq);
-    last_s1_time = ktime_set(0, 0);
     last_key_time = ktime_set(0, 0);
+    last_step_time = ktime_set(0, 0);
+    last_step_dir = 0;
 
     /* Allocate Character Device Number */
     ret = alloc_chrdev_region(&dev_number, 0, 1, DEVICE_NAME);
@@ -417,11 +503,37 @@ static int __init ec11_init(void)
         goto free_key;
     }
 
-    ret = request_irq(irq_s1, ec11_s1_irq_handler,
-                      IRQF_TRIGGER_FALLING, "ec11_s1_irq", NULL);
+    /* Initial decoder state from the current line levels */
+    enc_state = (gpio_get_value(real_gpio_s1) ? 2 : 0) |
+                (gpio_get_value(real_gpio_s2) ? 1 : 0);
+    enc_acc = 0;
+
+    if (steps_per_detent != 2 && steps_per_detent != 4) {
+        pr_warn("ec11: steps_per_detent=%d invalid, using 4\n", steps_per_detent);
+        steps_per_detent = 4;
+    }
+
+    ret = request_irq(irq_s1, ec11_rot_irq_handler,
+                      IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, "ec11_s1_irq", NULL);
     if (ret) {
         pr_err("ec11: Failed to request S1 IRQ %d (err: %d)\n", irq_s1, ret);
         goto free_key;
+    }
+
+    /* Setup IRQ for S2 (both edges) - needed for full quadrature decoding */
+    irq_s2 = gpio_to_irq(real_gpio_s2);
+    if (irq_s2 < 0) {
+        pr_err("ec11: Failed to map S2 GPIO to IRQ (err: %d)\n", irq_s2);
+        ret = irq_s2;
+        goto free_irq_s1;
+    }
+
+    ret = request_irq(irq_s2, ec11_rot_irq_handler,
+                      IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, "ec11_s2_irq", NULL);
+    if (ret) {
+        pr_err("ec11: Failed to request S2 IRQ %d (err: %d)\n", irq_s2, ret);
+        irq_s2 = -1;
+        goto free_irq_s1;
     }
 
     /* Setup IRQ for KEY (Falling Edge) */
@@ -429,22 +541,27 @@ static int __init ec11_init(void)
     if (irq_key < 0) {
         pr_err("ec11: Failed to map KEY GPIO to IRQ (err: %d)\n", irq_key);
         ret = irq_key;
-        goto free_irq_s1;
+        goto free_irq_s2;
     }
 
     ret = request_irq(irq_key, ec11_key_irq_handler,
                       IRQF_TRIGGER_FALLING, "ec11_key_irq", NULL);
     if (ret) {
         pr_err("ec11: Failed to request KEY IRQ %d (err: %d)\n", irq_key, ret);
-        goto free_irq_s1;
+        irq_key = -1;
+        goto free_irq_s2;
     }
 
-    pr_info("ec11: Driver loaded successfully (/dev/%s created, S1 IRQ:%d, KEY IRQ:%d)\n",
-            DEVICE_NAME, irq_s1, irq_key);
+    pr_info("ec11: Driver loaded (/dev/%s, S1 IRQ:%d, S2 IRQ:%d, KEY IRQ:%d, %d steps/detent)\n",
+            DEVICE_NAME, irq_s1, irq_s2, irq_key, steps_per_detent);
     return 0;
 
+free_irq_s2:
+    free_irq(irq_s2, NULL);
+    irq_s2 = -1;
 free_irq_s1:
     free_irq(irq_s1, NULL);
+    irq_s1 = -1;
 free_key:
     gpio_free(real_gpio_key);
 free_s2:
@@ -466,6 +583,8 @@ static void __exit ec11_exit(void)
 {
     if (irq_key >= 0)
         free_irq(irq_key, NULL);
+    if (irq_s2 >= 0)
+        free_irq(irq_s2, NULL);
     if (irq_s1 >= 0)
         free_irq(irq_s1, NULL);
 
@@ -492,4 +611,4 @@ module_exit(ec11_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("AIDL Embedded Driver Team");
 MODULE_DESCRIPTION("EC11 Rotary Encoder Driver (S1, S2, KEY) for Jetson Orin Nano");
-MODULE_VERSION("1.1");
+MODULE_VERSION("1.2");
