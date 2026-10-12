@@ -579,3 +579,8 @@ datasets/
 /project_admin/step_guide_images/
 /project_admin/AGENTS.md
 EOF
+
+# Generated executable and local backups
+/fan_controller
+/tests/*.bak
+/tests/*.before-*

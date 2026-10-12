@@ -1,0 +1,14 @@
+CC = gcc
+LED_ACTIVE_LOW ?= 0
+CPPFLAGS += $(shell pkg-config --cflags libgpiod) -DLED_ACTIVE_LOW=$(LED_ACTIVE_LOW)
+CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -O2
+LDLIBS += $(shell pkg-config --libs libgpiod)
+
+.PHONY: all clean
+all: fan_controller
+
+fan_controller: tests/fan_controller.c tests/fan.c tests/fan.h tests/ledbar.c tests/ledbar.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/fan_controller.c tests/fan.c tests/ledbar.c -o $@ $(LDLIBS)
+
+clean:
+	rm -f fan_controller
