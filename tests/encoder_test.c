@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "ledbar.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <gpiod.h>
@@ -100,8 +101,10 @@ int main(void)
     int result = 1;
     int values[2];
     int previous, synced, sum = 0, speed = 0;
-
+    
+    int displayed_speed = 0;
     struct sigaction action = {0};
+    struct ledbar leds = {0};
     action.sa_handler = stop_program;
     sigemptyset(&action.sa_mask);
 
@@ -166,6 +169,11 @@ int main(void)
     if (!synced)
         puts("Waiting for state 00 before counting.");
 
+    if (ledbar_init(&leds,chip) < 0) {
+	perror("initialize LED outputs");
+	goto cleanup;
+    }
+
     while (running) {
         /* Keep one queued event per line, then pick the earlier one. */
         for (int i = 0; i < 2; i++) {
@@ -215,11 +223,25 @@ int main(void)
 
         have[i] = 0;
         decode(&previous, current, &sum, &synced, &speed);
+	
+	  if (speed != displayed_speed) {
+            if (ledbar_set(&leds, speed) < 0) {
+                perror("update LED outputs");
+                goto cleanup;
+            }
+            displayed_speed = speed;
+        }
     }
 
     result = 0;
 
 cleanup:
+    if (ledbar_close(&leds) < 0) {
+        perror("turn LEDs off");
+        result = 1;
+    }
+
+    /* Keep the existing encoder cleanup below this point. */
     for (int i = 0; i < requested; i++)
         gpiod_line_release(lines[i]);
     if (chip)
