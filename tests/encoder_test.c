@@ -26,7 +26,7 @@ static int earlier(const struct timespec *a, const struct timespec *b)
 
 /* Decode transitions, counting a complete cycle at state 00. */
 static void decode(int *previous, int current,
-                   int *sum, int *synced, int *position)
+                   int *sum, int *synced, int *speed)
 {
     /* Positive sequence: 00 -> 10 -> 11 -> 01 -> 00 */
     static const int delta[16] = {
@@ -70,8 +70,19 @@ static void decode(int *previous, int current,
     if (current == 0) {
         if (*sum == 4 || *sum == -4) {
             int step = (*sum > 0) ? 1 : -1;
-            *position += step;
-            printf("STEP: %+d   position: %d\n", step, *position);
+                        int next = *speed + step;
+
+            if (next < 0)
+                next = 0;
+            else if (next > 8)
+                next = 8;
+
+            if (next == *speed) {
+                printf("LIMIT: speed remains %d / 8\n", *speed);
+            } else {
+                *speed = next;
+                printf("SPEED: %d / 8\n", *speed);
+            }
         }
         *sum = 0;
     }
@@ -88,7 +99,7 @@ int main(void)
     int requested = 0;
     int result = 1;
     int values[2];
-    int previous, synced, sum = 0, position = 0;
+    int previous, synced, sum = 0, speed = 0;
 
     struct sigaction action = {0};
     action.sa_handler = stop_program;
@@ -203,7 +214,7 @@ int main(void)
             current &= ~bit;
 
         have[i] = 0;
-        decode(&previous, current, &sum, &synced, &position);
+        decode(&previous, current, &sum, &synced, &speed);
     }
 
     result = 0;
