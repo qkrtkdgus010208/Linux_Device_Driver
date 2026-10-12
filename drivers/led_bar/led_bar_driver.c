@@ -26,7 +26,6 @@
 
 #include "../../include/common_ioctl.h"
 
-#define DRIVER_NAME "led_bar"
 #define CLASS_NAME  "led_bar_class"
 #define DEVICE_NAME "led_bar"
 
@@ -243,33 +242,6 @@ static int __init led_init(void)
         return ret;
     }
 
-    cdev_init(&led_cdev, &led_fops);
-    led_cdev.owner = THIS_MODULE;
-    ret = cdev_add(&led_cdev, dev_number, 1);
-    if (ret < 0) {
-        pr_err("led_bar: Failed to add cdev\n");
-        goto unregister_chrdev;
-    }
-
-    /* Create Device Class */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    led_class = class_create(CLASS_NAME);
-#else
-    led_class = class_create(THIS_MODULE, CLASS_NAME);
-#endif
-    if (IS_ERR(led_class)) {
-        pr_err("led_bar: Failed to create class\n");
-        ret = PTR_ERR(led_class);
-        goto del_cdev;
-    }
-
-    led_device = device_create(led_class, NULL, dev_number, NULL, DEVICE_NAME);
-    if (IS_ERR(led_device)) {
-        pr_err("led_bar: Failed to create device /dev/%s\n", DEVICE_NAME);
-        ret = PTR_ERR(led_device);
-        goto destroy_class;
-    }
-
     /* Request and Initialize 8 GPIO Pins */
     for (i = 0; i < NUM_BARS; i++) {
         char label[16];
@@ -286,23 +258,50 @@ static int __init led_init(void)
         gpio_direction_output(real_gpios[i], active_low ? 1 : 0);
     }
 
+    /* Create Device Class */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    led_class = class_create(CLASS_NAME);
+#else
+    led_class = class_create(THIS_MODULE, CLASS_NAME);
+#endif
+    if (IS_ERR(led_class)) {
+        pr_err("led_bar: Failed to create class\n");
+        ret = PTR_ERR(led_class);
+        goto free_gpios_all;
+    }
+
+    cdev_init(&led_cdev, &led_fops);
+    led_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&led_cdev, dev_number, 1);
+    if (ret < 0) {
+        pr_err("led_bar: Failed to add cdev\n");
+        goto destroy_class;
+    }
+
+    led_device = device_create(led_class, NULL, dev_number, NULL, DEVICE_NAME);
+    if (IS_ERR(led_device)) {
+        pr_err("led_bar: Failed to create device /dev/%s\n", DEVICE_NAME);
+        ret = PTR_ERR(led_device);
+        goto del_cdev;
+    }
+
     set_led_level(0);
 
     pr_info("led_bar: Driver loaded successfully (/dev/%s created, 8 bars initialized)\n",
             DEVICE_NAME);
     return 0;
 
+del_cdev:
+    cdev_del(&led_cdev);
+destroy_class:
+    class_destroy(led_class);
+free_gpios_all:
+    i = NUM_BARS;
 free_gpios:
     while (--i >= 0) {
         gpio_set_value(real_gpios[i], active_low ? 1 : 0);
         gpio_free(real_gpios[i]);
     }
-    device_destroy(led_class, dev_number);
-destroy_class:
-    class_destroy(led_class);
-del_cdev:
-    cdev_del(&led_cdev);
-unregister_chrdev:
     unregister_chrdev_region(dev_number, 1);
     return ret;
 }
@@ -311,17 +310,22 @@ static void __exit led_exit(void)
 {
     int i;
 
-    /* Turn off all LEDs and free GPIOs */
-    for (i = 0; i < NUM_BARS; i++) {
-        gpio_set_value(real_gpios[i], active_low ? 1 : 0);
-        gpio_free(real_gpios[i]);
-    }
+    /* Turn off all LEDs first */
+    set_led_level(0);
 
+    /* Destroy user interfaces first */
     if (led_class) {
         device_destroy(led_class, dev_number);
         class_destroy(led_class);
     }
     cdev_del(&led_cdev);
+
+    /* Free all GPIO lines in reverse order */
+    for (i = NUM_BARS - 1; i >= 0; i--) {
+        gpio_set_value(real_gpios[i], active_low ? 1 : 0);
+        gpio_free(real_gpios[i]);
+    }
+
     unregister_chrdev_region(dev_number, 1);
 
     pr_info("led_bar: Driver unloaded\n");

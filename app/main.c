@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -49,7 +48,6 @@ static int g_fd_ledbar = -1;
 
 static int g_speed_step = 0;       /* 0 to 8 */
 static int g_direction = MOTOR_DIR_FORWARD;
-static int g_enabled = 1;          /* 1: running, 0: paused/disabled */
 static int g_position = 0;
 
 /* Signal Handler for graceful shutdown */
@@ -64,55 +62,51 @@ static void update_hardware(void)
 {
     int speed_percent = 0;
 
-    if (g_enabled && g_speed_step > 0) {
+    if (g_speed_step > 0)
         speed_percent = speed_table[g_speed_step];
-    } else {
+    else
         speed_percent = 0;
-    }
 
-    /* Update Motor Direction */
+    /* Update Motor Direction and Speed */
     if (g_fd_motor >= 0) {
         int dir = (speed_percent == 0) ? MOTOR_DIR_STOP : g_direction;
         ioctl(g_fd_motor, MOTOR_IOCTL_SET_DIR, &dir);
         ioctl(g_fd_motor, MOTOR_IOCTL_SET_SPEED, &speed_percent);
     }
 
-    /* Update LED Bar */
+    /* Update LED Bar Level */
     if (g_fd_ledbar >= 0) {
-        int led_level = (g_enabled) ? g_speed_step : 0;
-        ioctl(g_fd_ledbar, LEDBAR_IOCTL_SET_LEVEL, &led_level);
+        ioctl(g_fd_ledbar, LEDBAR_IOCTL_SET_LEVEL, &g_speed_step);
     }
 }
 
 /* Render Dashboard in Console */
 static void render_dashboard(void)
 {
-    int speed_percent = (g_enabled && g_speed_step > 0) ? speed_table[g_speed_step] : 0;
+    int speed_percent = (g_speed_step > 0) ? speed_table[g_speed_step] : 0;
     char bar_str[64];
     int i;
+    int idx = 2;
 
     /* Build visual bar meter string */
     bar_str[0] = '[';
     bar_str[1] = ' ';
-    int idx = 2;
     for (i = 1; i <= 8; i++) {
-        if (i <= g_speed_step && g_enabled) {
+        if (i <= g_speed_step)
             bar_str[idx++] = '#';
-        } else {
+        else
             bar_str[idx++] = '.';
-        }
         bar_str[idx++] = ' ';
     }
     bar_str[idx++] = ']';
     bar_str[idx] = '\0';
 
-    /* Clear screen or reposition cursor */
+    /* Clear screen and reposition cursor */
     printf("\033[H\033[J");
     printf("==================================================================\n");
     printf("          JETSON ORIN NANO EMBEDDED MOTOR CONTROLLER              \n");
     printf("==================================================================\n");
     printf(" System State : [%s]\n",
-           !g_enabled ? "PAUSED / MUTED" :
            (g_speed_step == 0 ? "IDLE / STOPPED" : "RUNNING"));
     printf(" Direction    : [%s]\n",
            g_direction == MOTOR_DIR_FORWARD ? "FORWARD  (Clockwise)" :
@@ -139,7 +133,7 @@ static void cleanup_hardware(void)
         int stop_dir = MOTOR_DIR_STOP;
         ioctl(g_fd_motor, MOTOR_IOCTL_SET_SPEED, &zero);
         ioctl(g_fd_motor, MOTOR_IOCTL_SET_DIR, &stop_dir);
-        ioctl(g_fd_motor, MOTOR_IOCTL_STOP, NULL);
+        ioctl(g_fd_motor, MOTOR_IOCTL_STOP, 0);
         close(g_fd_motor);
         g_fd_motor = -1;
     }
@@ -162,6 +156,8 @@ static void cleanup_hardware(void)
 int main(int argc, char *argv[])
 {
     struct sigaction sa;
+    struct pollfd pfd;
+    int64_t last_toggle_ms = 0;
 
     (void)argc;
     (void)argv;
@@ -176,7 +172,7 @@ int main(int argc, char *argv[])
     g_fd_ec11 = open(DEV_EC11, O_RDONLY | O_NONBLOCK);
     if (g_fd_ec11 < 0) {
         fprintf(stderr, "Error: Cannot open %s: %s\n", DEV_EC11, strerror(errno));
-        fprintf(stderr, "Hint: Did you insert the module? Try: sudo insmod drivers/encoder/ec11_driver.ko\n");
+        fprintf(stderr, "Hint: Did you insert the module? Try: sudo make load\n");
         return EXIT_FAILURE;
     }
 
@@ -184,7 +180,7 @@ int main(int argc, char *argv[])
     g_fd_motor = open(DEV_MOTOR, O_RDWR);
     if (g_fd_motor < 0) {
         fprintf(stderr, "Error: Cannot open %s: %s\n", DEV_MOTOR, strerror(errno));
-        fprintf(stderr, "Hint: Did you insert the module? Try: sudo insmod drivers/motor/l298n_driver.ko\n");
+        fprintf(stderr, "Hint: Did you insert the module? Try: sudo make load\n");
         close(g_fd_ec11);
         return EXIT_FAILURE;
     }
@@ -193,7 +189,7 @@ int main(int argc, char *argv[])
     g_fd_ledbar = open(DEV_LEDBAR, O_RDWR);
     if (g_fd_ledbar < 0) {
         fprintf(stderr, "Error: Cannot open %s: %s\n", DEV_LEDBAR, strerror(errno));
-        fprintf(stderr, "Hint: Did you insert the module? Try: sudo insmod drivers/led_bar/led_bar_driver.ko\n");
+        fprintf(stderr, "Hint: Did you insert the module? Try: sudo make load\n");
         close(g_fd_ec11);
         close(g_fd_motor);
         return EXIT_FAILURE;
@@ -211,12 +207,9 @@ int main(int argc, char *argv[])
     update_hardware();
     render_dashboard();
 
-    /* Prepare poll structure for EC11 only (no keyboard polling) */
-    struct pollfd pfd;
+    /* Prepare poll structure for EC11 */
     pfd.fd = g_fd_ec11;
     pfd.events = POLLIN;
-
-    int64_t last_toggle_ms = 0;
 
     while (g_running) {
         int poll_ret = poll(&pfd, 1, 1000); /* 1000ms timeout for periodic refresh */
@@ -266,7 +259,7 @@ int main(int argc, char *argv[])
                             g_direction = MOTOR_DIR_FORWARD;
                         }
 
-                        /* Flash LED bar briefly for direction change indication */
+                        /* Flash LED bar briefly for direction change feedback */
                         if (g_fd_ledbar >= 0) {
                             uint8_t flash_mask = 0xFF;
                             ioctl(g_fd_ledbar, LEDBAR_IOCTL_SET_RAW, &flash_mask);

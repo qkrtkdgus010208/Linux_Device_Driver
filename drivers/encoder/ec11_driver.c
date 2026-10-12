@@ -6,7 +6,7 @@
  *   S2  (Channel B / DT ): Pin 13 (PY.00, offset 122)
  *   KEY (Push Switch/ SW): Pin 15 (PN.01, offset 85)
  *   GND (Ground         ): Pin 6 (or any GND)
- *   5V  (Module Power   ): Pin 1 (3.3V recommended for Jetson logic level)
+ *   VCC (Module Power   ): Pin 1 (3.3V recommended for Jetson logic level)
  * Device Node: /dev/ec11
  */
 
@@ -27,11 +27,10 @@
 
 #include "../../include/common_ioctl.h"
 
-#define DRIVER_NAME "ec11_encoder"
 #define CLASS_NAME  "ec11_class"
 #define DEVICE_NAME "ec11"
 
-#define QUEUE_SIZE 64
+#define QUEUE_SIZE  64
 
 /* Module Parameters */
 static int gpio_base = -1;
@@ -50,35 +49,9 @@ static int pin_key = 85;
 module_param(pin_key, int, 0644);
 MODULE_PARM_DESC(pin_key, "KEY (Push Switch / SW) line offset (default 85 for Pin 15)");
 
-/* Backward compatibility parameter aliases */
-static int pin_clk = -1;
-module_param(pin_clk, int, 0644);
-MODULE_PARM_DESC(pin_clk, "Alias for pin_s1");
-
-static int pin_dt = -1;
-module_param(pin_dt, int, 0644);
-MODULE_PARM_DESC(pin_dt, "Alias for pin_s2");
-
-static int pin_sw = -1;
-module_param(pin_sw, int, 0644);
-MODULE_PARM_DESC(pin_sw, "Alias for pin_key");
-
-/*
- * Kept only so existing "insmod ... debounce_ms=N" command lines still load.
- * Rotation no longer uses a time filter: the quadrature state machine below
- * rejects contact bounce by itself, and a time filter would drop real edges.
- */
-static int debounce_ms = 0;
-module_param(debounce_ms, int, 0644);
-MODULE_PARM_DESC(debounce_ms, "Deprecated, ignored (rotation is decoded by a quadrature state machine)");
-
 static int steps_per_detent = 4;
 module_param(steps_per_detent, int, 0644);
-MODULE_PARM_DESC(steps_per_detent, "Quadrature transitions per detent: 4 = full cycle per click (default), 2 = half cycle per click");
-
-static int rebound_ms = 0;
-module_param(rebound_ms, int, 0644);
-MODULE_PARM_DESC(rebound_ms, "Deprecated, ignored (recoil rejected naturally by Buxtronix FSM)");
+MODULE_PARM_DESC(steps_per_detent, "Quadrature transitions per detent (default 4)");
 
 static int key_debounce_ms = 150;
 module_param(key_debounce_ms, int, 0644);
@@ -415,14 +388,6 @@ static int __init ec11_init(void)
 {
     int ret;
 
-    /* Handle legacy alias parameters if set */
-    if (pin_clk >= 0)
-        pin_s1 = pin_clk;
-    if (pin_dt >= 0)
-        pin_s2 = pin_dt;
-    if (pin_sw >= 0)
-        pin_key = pin_sw;
-
     spin_lock_init(&queue_lock);
     init_waitqueue_head(&ec11_waitq);
     last_key_time = ktime_set(0, 0);
@@ -432,33 +397,6 @@ static int __init ec11_init(void)
     if (ret < 0) {
         pr_err("ec11: Failed to allocate chrdev region\n");
         return ret;
-    }
-
-    cdev_init(&ec11_cdev, &ec11_fops);
-    ec11_cdev.owner = THIS_MODULE;
-    ret = cdev_add(&ec11_cdev, dev_number, 1);
-    if (ret < 0) {
-        pr_err("ec11: Failed to add cdev\n");
-        goto unregister_chrdev;
-    }
-
-    /* Create Device Class (compat with Linux < 6.4 and >= 6.4) */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    ec11_class = class_create(CLASS_NAME);
-#else
-    ec11_class = class_create(THIS_MODULE, CLASS_NAME);
-#endif
-    if (IS_ERR(ec11_class)) {
-        pr_err("ec11: Failed to create class\n");
-        ret = PTR_ERR(ec11_class);
-        goto del_cdev;
-    }
-
-    ec11_device = device_create(ec11_class, NULL, dev_number, NULL, DEVICE_NAME);
-    if (IS_ERR(ec11_device)) {
-        pr_err("ec11: Failed to create device /dev/%s\n", DEVICE_NAME);
-        ret = PTR_ERR(ec11_device);
-        goto destroy_class;
     }
 
     /* Resolve and Request GPIOs */
@@ -472,7 +410,7 @@ static int __init ec11_init(void)
     ret = gpio_request(real_gpio_s1, "ec11_s1");
     if (ret) {
         pr_err("ec11: Failed to request S1 GPIO %d (err: %d)\n", real_gpio_s1, ret);
-        goto destroy_dev;
+        goto unregister_chrdev;
     }
     gpio_direction_input(real_gpio_s1);
 
@@ -490,7 +428,7 @@ static int __init ec11_init(void)
     }
     gpio_direction_input(real_gpio_key);
 
-    /* Setup IRQ for S1 (Falling Edge) */
+    /* Setup IRQ for S1 (both edges) */
     irq_s1 = gpio_to_irq(real_gpio_s1);
     if (irq_s1 < 0) {
         pr_err("ec11: Failed to map S1 GPIO to IRQ (err: %d)\n", irq_s1);
@@ -514,6 +452,7 @@ static int __init ec11_init(void)
                       IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING, "ec11_s1_irq", NULL);
     if (ret) {
         pr_err("ec11: Failed to request S1 IRQ %d (err: %d)\n", irq_s1, ret);
+        irq_s1 = -1;
         goto free_key;
     }
 
@@ -533,7 +472,7 @@ static int __init ec11_init(void)
         goto free_irq_s1;
     }
 
-    /* Setup IRQ for KEY (Falling Edge) */
+    /* Setup IRQ for KEY (falling edge) */
     irq_key = gpio_to_irq(real_gpio_key);
     if (irq_key < 0) {
         pr_err("ec11: Failed to map KEY GPIO to IRQ (err: %d)\n", irq_key);
@@ -549,28 +488,62 @@ static int __init ec11_init(void)
         goto free_irq_s2;
     }
 
+    /* Create Device Class */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    ec11_class = class_create(CLASS_NAME);
+#else
+    ec11_class = class_create(THIS_MODULE, CLASS_NAME);
+#endif
+    if (IS_ERR(ec11_class)) {
+        pr_err("ec11: Failed to create class\n");
+        ret = PTR_ERR(ec11_class);
+        goto free_irq_key;
+    }
+
+    cdev_init(&ec11_cdev, &ec11_fops);
+    ec11_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&ec11_cdev, dev_number, 1);
+    if (ret < 0) {
+        pr_err("ec11: Failed to add cdev\n");
+        goto destroy_class;
+    }
+
+    ec11_device = device_create(ec11_class, NULL, dev_number, NULL, DEVICE_NAME);
+    if (IS_ERR(ec11_device)) {
+        pr_err("ec11: Failed to create device /dev/%s\n", DEVICE_NAME);
+        ret = PTR_ERR(ec11_device);
+        goto del_cdev;
+    }
+
     pr_info("ec11: Driver loaded (/dev/%s, S1 IRQ:%d, S2 IRQ:%d, KEY IRQ:%d, %d steps/detent)\n",
             DEVICE_NAME, irq_s1, irq_s2, irq_key, steps_per_detent);
     return 0;
 
+del_cdev:
+    cdev_del(&ec11_cdev);
+destroy_class:
+    class_destroy(ec11_class);
+free_irq_key:
+    if (irq_key >= 0)
+        free_irq(irq_key, NULL);
+    irq_key = -1;
 free_irq_s2:
-    free_irq(irq_s2, NULL);
+    if (irq_s2 >= 0)
+        free_irq(irq_s2, NULL);
     irq_s2 = -1;
 free_irq_s1:
-    free_irq(irq_s1, NULL);
+    if (irq_s1 >= 0)
+        free_irq(irq_s1, NULL);
     irq_s1 = -1;
 free_key:
     gpio_free(real_gpio_key);
+    real_gpio_key = -1;
 free_s2:
     gpio_free(real_gpio_s2);
+    real_gpio_s2 = -1;
 free_s1:
     gpio_free(real_gpio_s1);
-destroy_dev:
-    device_destroy(ec11_class, dev_number);
-destroy_class:
-    class_destroy(ec11_class);
-del_cdev:
-    cdev_del(&ec11_cdev);
+    real_gpio_s1 = -1;
 unregister_chrdev:
     unregister_chrdev_region(dev_number, 1);
     return ret;
@@ -578,6 +551,14 @@ unregister_chrdev:
 
 static void __exit ec11_exit(void)
 {
+    /* Tear down user-facing device interfaces first */
+    if (ec11_class) {
+        device_destroy(ec11_class, dev_number);
+        class_destroy(ec11_class);
+    }
+    cdev_del(&ec11_cdev);
+
+    /* Release hardware interrupts and GPIOs */
     if (irq_key >= 0)
         free_irq(irq_key, NULL);
     if (irq_s2 >= 0)
@@ -592,11 +573,6 @@ static void __exit ec11_exit(void)
     if (real_gpio_s1 >= 0)
         gpio_free(real_gpio_s1);
 
-    if (ec11_class) {
-        device_destroy(ec11_class, dev_number);
-        class_destroy(ec11_class);
-    }
-    cdev_del(&ec11_cdev);
     unregister_chrdev_region(dev_number, 1);
 
     pr_info("ec11: Driver unloaded\n");

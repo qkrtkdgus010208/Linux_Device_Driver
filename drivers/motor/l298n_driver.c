@@ -2,7 +2,7 @@
  * L298N DC Motor Driver (HW-095)
  * Platform: NVIDIA Jetson Orin Nano / JetPack 5/6 (Linux Kernel 5.10 / 5.15)
  * Hardware Connections (Jetson 40-Pin Header):
- *   ENA (Speed PWM): Pin 32 (PG.06, 32e0000.pwm, pwmchip1)
+ *   ENA (Speed PWM): Pin 32 (PG.06, 32e0000.pwm, pwmchip1 / pwmchip3)
  *   IN1 (Direction 1): Pin 29 (PQ.05, offset 105)
  *   IN2 (Direction 2): Pin 31 (PQ.06, offset 106)
  * Device Node: /dev/l298n_motor
@@ -22,7 +22,6 @@
 
 #include "../../include/common_ioctl.h"
 
-#define DRIVER_NAME "l298n_motor"
 #define CLASS_NAME  "l298n_class"
 #define DEVICE_NAME "l298n_motor"
 
@@ -101,7 +100,7 @@ static int resolve_gpio(int offset)
     return gpio_base + offset;
 }
 
-/* Hardware Hardware Control */
+/* Hardware Control */
 static void apply_direction(enum motor_dir dir)
 {
     switch (dir) {
@@ -324,33 +323,6 @@ static int __init motor_init(void)
         return ret;
     }
 
-    cdev_init(&motor_cdev, &motor_fops);
-    motor_cdev.owner = THIS_MODULE;
-    ret = cdev_add(&motor_cdev, dev_number, 1);
-    if (ret < 0) {
-        pr_err("l298n: Failed to add cdev\n");
-        goto unregister_chrdev;
-    }
-
-    /* Create Device Class */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    motor_class = class_create(CLASS_NAME);
-#else
-    motor_class = class_create(THIS_MODULE, CLASS_NAME);
-#endif
-    if (IS_ERR(motor_class)) {
-        pr_err("l298n: Failed to create class\n");
-        ret = PTR_ERR(motor_class);
-        goto del_cdev;
-    }
-
-    motor_device = device_create(motor_class, NULL, dev_number, NULL, DEVICE_NAME);
-    if (IS_ERR(motor_device)) {
-        pr_err("l298n: Failed to create device /dev/%s\n", DEVICE_NAME);
-        ret = PTR_ERR(motor_device);
-        goto destroy_class;
-    }
-
     /* Resolve and Request Direction GPIOs */
     real_gpio_in1 = resolve_gpio(pin_in1);
     real_gpio_in2 = resolve_gpio(pin_in2);
@@ -358,7 +330,7 @@ static int __init motor_init(void)
     ret = gpio_request(real_gpio_in1, "l298n_in1");
     if (ret) {
         pr_err("l298n: Failed to request IN1 GPIO %d (err: %d)\n", real_gpio_in1, ret);
-        goto destroy_dev;
+        goto unregister_chrdev;
     }
     gpio_direction_output(real_gpio_in1, 0);
 
@@ -389,18 +361,55 @@ static int __init motor_init(void)
         pr_info("l298n: PWM requested successfully (period: %d ns)\n", pwm_period_ns);
     }
 
+    /* Create Device Class */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    motor_class = class_create(CLASS_NAME);
+#else
+    motor_class = class_create(THIS_MODULE, CLASS_NAME);
+#endif
+    if (IS_ERR(motor_class)) {
+        pr_err("l298n: Failed to create class\n");
+        ret = PTR_ERR(motor_class);
+        goto free_pwm;
+    }
+
+    cdev_init(&motor_cdev, &motor_fops);
+    motor_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&motor_cdev, dev_number, 1);
+    if (ret < 0) {
+        pr_err("l298n: Failed to add cdev\n");
+        goto destroy_class;
+    }
+
+    motor_device = device_create(motor_class, NULL, dev_number, NULL, DEVICE_NAME);
+    if (IS_ERR(motor_device)) {
+        pr_err("l298n: Failed to create device /dev/%s\n", DEVICE_NAME);
+        ret = PTR_ERR(motor_device);
+        goto del_cdev;
+    }
+
     pr_info("l298n: Driver loaded successfully (/dev/%s created, IN1:%d, IN2:%d)\n",
             DEVICE_NAME, real_gpio_in1, real_gpio_in2);
     return 0;
 
-free_in1:
-    gpio_free(real_gpio_in1);
-destroy_dev:
-    device_destroy(motor_class, dev_number);
-destroy_class:
-    class_destroy(motor_class);
 del_cdev:
     cdev_del(&motor_cdev);
+destroy_class:
+    class_destroy(motor_class);
+free_pwm:
+    if (motor_pwm) {
+        pwm_config(motor_pwm, 0, pwm_period_ns);
+        pwm_disable(motor_pwm);
+        pwm_free(motor_pwm);
+        motor_pwm = NULL;
+    }
+    gpio_direction_output(real_gpio_in2, 0);
+    gpio_free(real_gpio_in2);
+    real_gpio_in2 = -1;
+free_in1:
+    gpio_direction_output(real_gpio_in1, 0);
+    gpio_free(real_gpio_in1);
+    real_gpio_in1 = -1;
 unregister_chrdev:
     unregister_chrdev_region(dev_number, 1);
     return ret;
@@ -408,27 +417,39 @@ unregister_chrdev:
 
 static void __exit motor_exit(void)
 {
-    /* Safe shutdown: stop motor and disable PWM */
-    if (real_gpio_in1 >= 0) {
+    /* Safe shutdown: stop motor first */
+    if (real_gpio_in1 >= 0)
         gpio_set_value(real_gpio_in1, 0);
-        gpio_free(real_gpio_in1);
-    }
-    if (real_gpio_in2 >= 0) {
+    if (real_gpio_in2 >= 0)
         gpio_set_value(real_gpio_in2, 0);
-        gpio_free(real_gpio_in2);
-    }
 
     if (motor_pwm) {
         pwm_config(motor_pwm, 0, pwm_period_ns);
         pwm_disable(motor_pwm);
-        pwm_free(motor_pwm);
     }
 
+    /* Destroy user interfaces first */
     if (motor_class) {
         device_destroy(motor_class, dev_number);
         class_destroy(motor_class);
     }
     cdev_del(&motor_cdev);
+
+    /* Release hardware resources */
+    if (motor_pwm) {
+        pwm_free(motor_pwm);
+        motor_pwm = NULL;
+    }
+
+    if (real_gpio_in2 >= 0) {
+        gpio_free(real_gpio_in2);
+        real_gpio_in2 = -1;
+    }
+    if (real_gpio_in1 >= 0) {
+        gpio_free(real_gpio_in1);
+        real_gpio_in1 = -1;
+    }
+
     unregister_chrdev_region(dev_number, 1);
 
     pr_info("l298n: Driver unloaded\n");
