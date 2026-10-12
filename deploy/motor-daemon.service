@@ -1,0 +1,15 @@
+[Unit]
+Description=EC11 controlled L298N motor and LED level meter
+ConditionPathExists=/dev/ec11
+ConditionPathExists=/dev/l298n_motor
+ConditionPathExists=/dev/led_bar
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/motor_daemon
+User=root
+Restart=no
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
